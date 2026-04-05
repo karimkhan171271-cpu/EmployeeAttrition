@@ -1,196 +1,222 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import joblib
 import numpy as np
 import shap
 import matplotlib.pyplot as plt
 
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import RandomForestClassifier
+
+# Set matplotlib style
 plt.style.use("dark_background")
 
 # ================= PAGE CONFIG =================
 st.set_page_config(
-    page_title="HR Interactive Dashboard",
+    page_title="HR Strategic Analytics Dashboard",
     page_icon="📊",
     layout="wide"
 )
 
-# ================= POWER BI + 3D CSS =================
+# ================= STYLING =================
 st.markdown("""
 <style>
-.main {
-    background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
-    color: white;
-}
-h1, h2, h3 {
-    color: #00e5ff;
-    font-weight: 700;
-}
+.main { background: linear-gradient(135deg, #0f2027, #203a43, #2c5364); color: white; }
+h1, h2, h3 { color: #00e5ff !important; font-weight: 700; }
 .glass-card {
-    background: rgba(255, 255, 255, 0.12);
-    border-radius: 20px;
-    padding: 20px;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.37);
-    backdrop-filter: blur(10px);
-    border: 1px solid rgba(255,255,255,0.18);
-    margin-bottom: 20px;
-}
-.stButton > button {
-    background: linear-gradient(90deg, #00c6ff, #0072ff);
-    color: white;
+    background: rgba(255, 255, 255, 0.08);
     border-radius: 12px;
-    padding: 10px 24px;
-    font-size: 16px;
+    padding: 25px;
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.1);
+    margin-bottom: 25px;
 }
+.reason-box {
+    background: rgba(255, 75, 75, 0.05);
+    border-left: 4px solid #ff4b4b;
+    padding: 12px;
+    margin: 8px 0;
+}
+.stMetric { background: rgba(0,0,0,0.2); padding: 15px; border-radius: 8px; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📊 HR Interactive Analytics Dashboard")
-st.caption("Power BI–style 3D HR dashboard with Explainable AI (SHAP)")
-
-# ================= HELPER FUNCTIONS =================
-def decode_feature_value(feature, value, encoders):
-    if feature in encoders:
-        try:
-            return encoders[feature].inverse_transform([int(value)])[0]
-        except:
-            return value
-
-    ordinal_maps = {
-        "JobSatisfaction": {1: "Low", 2: "Medium", 3: "High", 4: "Very High"},
-        "WorkLifeBalance": {1: "Bad", 2: "Good", 3: "Better", 4: "Best"}
-    }
-    return ordinal_maps.get(feature, {}).get(value, value)
-
-def generate_risk_summary(prob, reasons):
-    level = "low" if prob <= 40 else "medium" if prob <= 70 else "high"
-    reasons_text = ", ".join(reasons[:3])
-    return f"This employee shows a **{level} risk of attrition**, mainly due to {reasons_text}."
+st.title("Attrition Sense: A Real Time HR Attrition Explainable System")
 
 # ================= FILE UPLOAD =================
-uploaded_file = st.file_uploader("Upload HR CSV File", type=["csv"])
+uploaded_file = st.file_uploader("Upload HR Data (CSV)", type=["csv"])
 
 if uploaded_file:
-    df = pd.read_csv(uploaded_file)
+    df_raw = pd.read_csv(uploaded_file).dropna(how='all', axis=1)
+    
+    # --- DATA PROCESSING ---
+    for col in df_raw.columns:
+        if any(k in col.lower() for k in ['date', 'dob', 'birth']):
+            try:
+                df_raw[col] = pd.to_datetime(df_raw[col], errors='coerce')
+                if 'hire' in col.lower():
+                    df_raw['TenureDays'] = (pd.Timestamp.now() - df_raw[col]).dt.days
+                if 'dob' in col.lower() or 'birth' in col.lower():
+                    df_raw['CalculatedAge'] = (pd.Timestamp.now() - df_raw[col]).dt.days // 365
+            except: pass
 
-    # ================= KPI CARDS =================
+    # --- COLUMN DETECTION ---
+    attr_keywords = ['attrition', 'left', 'turnover', 'exit', 'termd', 'employmentstatus']
+    attrition_col = next((c for c in df_raw.columns if c.lower() in attr_keywords), None)
+    salary_col = next((c for c in df_raw.columns if any(k in c.lower() for k in ['income', 'salary', 'pay'])), None)
+    dept_col = next((c for c in df_raw.columns if 'dept' in c.lower() or 'department' in c.lower()), None)
+    gender_col = next((c for c in df_raw.columns if 'gender' in c.lower() or 'sex' in c.lower()), None)
+    emp_id_col = next((c for c in df_raw.columns if any(k in c.lower() for k in ['id', 'number', 'code'])), None)
+    age_col = next((c for c in df_raw.columns if ('age' in c.lower() or 'calculatedage' in c.lower()) and pd.api.types.is_numeric_dtype(df_raw[c])), None)
+
+    # ================= SIDEBAR FILTERS =================
+    st.sidebar.header("Global Filters")
+    df = df_raw.copy()
+    
+    if dept_col:
+        depts = st.sidebar.multiselect("Department", df[dept_col].unique(), default=df[dept_col].unique())
+        df = df[df[dept_col].isin(depts)]
+    
+    if gender_col:
+        genders = st.sidebar.multiselect("Gender", df[gender_col].unique(), default=df[gender_col].unique())
+        df = df[df[gender_col].isin(genders)]
+
+    # ================= KPI SECTION =================
     st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("👥 Employees", len(df))
-    if "Attrition" in df.columns:
-        rate = df["Attrition"].value_counts(normalize=True).get("Yes", 0) * 100
-        c2.metric("📉 Attrition Rate", f"{rate:.2f}%")
-    if "MonthlyIncome" in df.columns:
-        c3.metric("💰 Avg Salary", f"₹{int(df['MonthlyIncome'].mean())}")
-    if "YearsAtCompany" in df.columns:
-        c4.metric("⏳ Avg Tenure", f"{df['YearsAtCompany'].mean():.1f} yrs")
+    c1.metric("Total Headcount", len(df))
+    if attrition_col:
+        temp_attr = df[attrition_col].apply(lambda x: 1 if str(x).lower() in ['yes', '1', 'true', 'left', 'terminated', 'voluntarily terminated'] else 0)
+        c2.metric("Attrition Rate", f"{temp_attr.mean()*100:.1f}%")
+    if salary_col:
+        df[salary_col] = pd.to_numeric(df[salary_col], errors='coerce')
+        c3.metric("Avg Monthly Pay", f"${int(df[salary_col].mean()):,}")
+    if age_col:
+        c4.metric("Avg Employee Age", f"{int(df[age_col].mean())} yrs")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # ================= VISUALS =================
-    col_l, col_r = st.columns(2)
+    # ================= VISUAL INSIGHTS HUB =================
+    st.header("Strategic Insights")
+    col_l, col_r = st.columns([3, 2])
+
     with col_l:
         st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
-        st.subheader("📈 Attrition by Job Role")
-        fig = px.histogram(df, x="JobRole", color="Attrition", barmode="group", 
-                           template="plotly_dark", color_discrete_map={"Yes": "#ff5252", "No": "#00e5ff"})
-        st.plotly_chart(fig, use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-    
-    with col_r:
-        st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
-        st.subheader("🧊 3D Salary Analysis")
-        fig3d = px.scatter_3d(df, x="MonthlyIncome", y="YearsAtCompany", z="Age", color="Attrition",
-                              template="plotly_dark", opacity=0.7, color_discrete_map={"Yes": "#ff5252", "No": "#00e5ff"})
+        st.subheader("3D Talent Attrition Mapping")
+        z_axis = age_col if age_col else df.columns[0]
+        y_axis = 'TenureDays' if 'TenureDays' in df.columns else df.columns[1]
+        
+        fig3d = px.scatter_3d(
+            df, x=salary_col, y=y_axis, z=z_axis,
+            color=attrition_col,
+            template="plotly_dark",
+            opacity=0.8,
+            color_discrete_sequence=['#00e5ff', '#ff4b4b']
+        )
         st.plotly_chart(fig3d, use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # ================= PREDICTION + SHAP =================
+    # ================= ML PREP =================
+    X_raw = df_raw.dropna(subset=[attrition_col]).copy()
+    y = X_raw[attrition_col].apply(lambda x: 1 if str(x).lower() in ['yes', '1', 'true', 'left', 'terminated', 'voluntarily terminated'] else 0)
+    
+    cols_to_drop = [attrition_col]
+    if emp_id_col: cols_to_drop.append(emp_id_col)
+    for c in X_raw.columns:
+        if any(k in c.lower() for k in ['date', 'name', 'surname', 'zip', 'email', 'id']):
+            if c not in cols_to_drop and c not in ['CalculatedAge', 'TenureDays']:
+                cols_to_drop.append(c)
+    
+    X = X_raw.drop(columns=cols_to_drop, errors='ignore')
+    encoders = {}
+    for col in X.select_dtypes(include=['object', 'category']).columns:
+        le = LabelEncoder()
+        X[col] = le.fit_transform(X[col].astype(str))
+        encoders[col] = le
+    X = X.select_dtypes(include=[np.number]).fillna(0)
+
+    # Train Model
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    model = RandomForestClassifier(n_estimators=100, class_weight="balanced", random_state=42)
+    model.fit(X_train, y_train)
+
+    with col_r:
+        st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
+        st.subheader("Key Attrition Drivers")
+        importances = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=True).tail(10)
+        fig_imp = px.bar(importances, orientation='h', template='plotly_dark')
+        st.plotly_chart(fig_imp, use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ================= SIMULATOR SECTION =================
+    st.header("Individual Retention Simulator")
     st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
-    st.subheader("🧠 Individual Attrition Analysis")
-
-    try:
-        model = joblib.load("attrition_model.pkl")
-        encoders = joblib.load("encoders.pkl")
-        model_features = joblib.load("model_features.pkl")
-        explainer = shap.TreeExplainer(model)
-    except Exception as e:
-        st.error(f"Error loading model artifacts: {e}")
-        st.stop()
-
-    emp_col = "EmployeeNumber" if "EmployeeNumber" in df.columns else None
-
-    if emp_col:
-        selected_emp = st.selectbox("Select Employee to Analyze", df[emp_col].unique())
-
-        if st.button("Generate Detailed Prediction"):
-            input_df = df[df[emp_col] == selected_emp].iloc[[0]].copy()
-            input_df.drop(columns=["Attrition"], errors="ignore", inplace=True)
-
-            for col, le in encoders.items():
-                if col in input_df.columns:
-                    try:
-                        input_df[col] = le.transform(input_df[col])
-                    except: pass
-
-            input_df = input_df.reindex(columns=model_features, fill_value=0)
-            prob = model.predict_proba(input_df)[0][1] * 100
+    
+    if emp_id_col:
+        selected_emp = st.selectbox("Select Employee for Analysis", df[emp_id_col].unique())
+        
+        # Get actual data
+        idx = df_raw[df_raw[emp_id_col] == selected_emp].index[0]
+        actual_data = X.loc[[idx]].copy()
+        
+        s1, s2 = st.columns([1, 2])
+        
+        with s1:
+            st.subheader("Intervention Controls")
+            st.info("Adjust parameters to simulate retention strategies.")
             
-            # Display Probability
-            st.metric("Risk Score", f"{prob:.2f}%")
+            sim_input = actual_data.copy()
+            for col in X.columns:
+                val = float(actual_data[col].iloc[0])
+                if col == salary_col:
+                    sim_input[col] = st.slider(f"Adjust {col}", val*0.5, val*2.0, val)
+                elif X[col].nunique() < 10:
+                    sim_input[col] = st.selectbox(f"Modify {col}", sorted(X[col].unique()), index=list(sorted(X[col].unique())).index(val))
+            
+        with s2:
+            orig_prob = model.predict_proba(actual_data)[0][1] * 100
+            sim_prob = model.predict_proba(sim_input)[0][1] * 100
+            
+            st.subheader("Predictive Risk Assessment")
+            diff = sim_prob - orig_prob
+            st.metric("Retention Risk Score", f"{sim_prob:.1f}%", delta=f"{diff:.1f}%", delta_color="inverse")
+            
+            # --- SHAP WATERFALL & REASONING ---
+            explainer = shap.Explainer(model, X_train)
+            shap_values = explainer(sim_input)
+            exp_to_plot = shap_values[0, :, 1] if len(shap_values.shape) == 3 else shap_values[0]
 
-            # SHAP Calculation Logic
-            shap_values = explainer.shap_values(input_df)
-            if isinstance(shap_values, list):
-                shap_vals = shap_values[1][0]
-                base_val = explainer.expected_value[1]
-            else:
-                if len(shap_values.shape) == 3:
-                    shap_vals = shap_values[0, :, 1]
-                    base_val = explainer.expected_value[1]
+            fig_sim, ax = plt.subplots(figsize=(10, 5))
+            shap.plots.waterfall(exp_to_plot, show=False)
+            plt.tight_layout()
+            st.pyplot(fig_sim)
+
+            # --- DYNAMIC REASONS & SUGGESTIONS ---
+            st.markdown("### Decision Factor Breakdown")
+            
+            # Extract top 3 drivers from SHAP
+            sv = exp_to_plot.values
+            top_reasons_idx = np.argsort(sv)[-3:][::-1]
+            
+            for r_idx in top_reasons_idx:
+                raw_col_name = X.columns[r_idx]
+                feature_name_lower = str(raw_col_name).lower()
+                
+                st.markdown(f"<div class='reason-box'>Primary Driver: <b>{raw_col_name}</b></div>", unsafe_allow_html=True)
+                
+                # Prescriptive Suggestion Logic
+                if 'salary' in feature_name_lower or 'income' in feature_name_lower:
+                    st.info(f"Strategic Recommendation: Compensation review required. Adjust {raw_col_name} to align with market benchmarks.")
+                elif 'overtime' in feature_name_lower:
+                    st.info("Strategic Recommendation: Work-life balance risk. Monitor workload and evaluate resource allocation.")
+                elif 'travel' in feature_name_lower or 'distance' in feature_name_lower:
+                    st.info("Strategic Recommendation: Logistical friction detected. Evaluate remote work eligibility or travel frequency.")
                 else:
-                    shap_vals = shap_values[0]
-                    base_val = explainer.expected_value
+                    st.info(f"Strategic Recommendation: Targeted management intervention required regarding {raw_col_name}.")
 
-            final_base_val = float(base_val[0]) if isinstance(base_val, (np.ndarray, list)) else float(base_val)
-
-            # --- PLOT SECTION ---
-            st.subheader("🔍 Breakdown of Decision Factors")
-            exp = shap.Explanation(
-                values=np.array(shap_vals, dtype=float),
-                base_values=final_base_val,
-                data=input_df.iloc[0].values,
-                feature_names=list(input_df.columns)
-            )
-
-            fig, ax = plt.subplots(figsize=(10, 5))
-            shap.plots.waterfall(exp, show=False)
-            plt.gcf().set_facecolor("#0f2027")
-            st.pyplot(plt.gcf())
-            plt.close()
-
-            # --- DYNAMIC EXPLANATION SECTION ---
-            st.markdown("---")
-            st.subheader("📝 Automated Insight & Recommendations")
-            
-            # Sort factors for text explanation
-            feature_impacts = pd.DataFrame({'Feature': input_df.columns, 'Impact': shap_vals}).sort_values(by='Impact', ascending=False)
-            top_risk = feature_impacts.iloc[0]
-            top_retention = feature_impacts.iloc[-1]
-
-            c1, c2 = st.columns(2)
-            with c1:
-                st.info(f"**Why the risk is high:**\n\nThe most significant driver is **{top_risk['Feature']}**, which increased the risk probability by **{top_risk['Impact']*100:.1f}%**. This suggests an issue in this specific area that needs HR intervention.")
-            
-            with c2:
-                st.success(f"**What is working well:**\n\n**{top_retention['Feature']}** is the strongest reason this employee stays. It reduces their attrition risk by **{abs(top_retention['Impact'])*100:.1f}%**. Leveraging this factor is key to retention.")
-
-            # Strategic Recommendation
-            st.markdown("### 💡 Recommended Action Plan")
-            if top_risk['Feature'] == "OverTime":
-                st.write("👉 **Action:** Review workload distribution. High overtime is the primary exit driver for this employee.")
-            elif top_risk['Feature'] == "MonthlyIncome":
-                st.write("👉 **Action:** Conduct a salary benchmark review. Current compensation is not meeting market expectations for this role.")
-            else:
-                st.write(f"👉 **Action:** Schedule a 1-on-1 feedback session focusing on **{top_risk['Feature']}** to address concerns before they lead to resignation.")
+            if sim_prob < orig_prob:
+                st.success("Intervention Status: Positive. The simulated changes indicate a reduction in attrition risk.")
+            elif sim_prob > orig_prob:
+                st.error("Intervention Status: Negative. The simulated changes indicate an increased likelihood of attrition.")
 
     st.markdown("</div>", unsafe_allow_html=True)
